@@ -1,0 +1,44 @@
+{
+  "name": "microsoft-entra-auth-fullstack",
+  "version": "1.0.0",
+  "description": "Sistema completo di autenticazione Microsoft Entra ID con React + Node.js",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install && cd auth-server && npm install && cd ../auth-frontend && npm install",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "start": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd auth-server && npm run dev",
+    "client": "cd auth-frontend && npm run dev",
+    "build": "cd auth-frontend && npm run build",
+    "build:server": "cd auth-server && npm start",
+    "test": "concurrently \"cd auth-server && npm test\" \"cd auth-frontend && npm test\"",
+    "clean": "rimraf auth-server/node_modules auth-frontend/node_modules node_modules",
+    "setup": "npm run clean && npm run install:all"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "rimraf": "^5.0.5"
+  },
+  "workspaces": [
+    "auth-server",
+    "auth-frontend"
+  ],
+  "keywords": [
+    "microsoft",
+    "entra-id",
+    "authentication",
+    "react",
+    "nodejs",
+    "fullstack"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "your-repo-url"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=7.0.0"
+  }
+}
