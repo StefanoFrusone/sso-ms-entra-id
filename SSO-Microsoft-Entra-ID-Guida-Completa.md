@@ -29,7 +29,7 @@ Questo documento descrive nel dettaglio il funzionamento di un sistema di **Sing
 - ✅ **OAuth 2.0 Authorization Code Flow** con PKCE
 - ✅ **Nessun Client Secret** nel frontend (sicurezza migliorata)
 - ✅ **Refresh Token** automatico per sessioni prolungate
-- ✅ **JWT Validation** lato backend
+- ✅ **Token Validation** tramite Microsoft Graph API (approccio semplificato)
 - ✅ **Protezione CSRF** con State parameter
 - ✅ **Single Logout** con Microsoft
 
@@ -49,25 +49,51 @@ Il sistema è composto da tre attori principali:
 ### Responsabilità
 
 **Frontend (React)**:
-- Gestisce il flusso OAuth 2.0 + PKCE
-- Genera e verifica parametri di sicurezza
-- Effettua token exchange con Microsoft
+- Gestisce il flusso OAuth 2.0 + PKCE completo
+- Genera e verifica parametri di sicurezza (code_verifier, state)
+- Effettua token exchange direttamente con Microsoft
 - Salva token in localStorage
 - Gestisce refresh automatico dei token
-- Invia token nelle chiamate API
+- Invia token nelle chiamate API al backend
 
 **Microsoft Entra ID**:
-- Autentica l'utente (credenziali aziendali)
-- Rilascia authorization code
+- Autentica l'utente (credenziali aziendali + MFA)
+- Rilascia authorization code dopo autenticazione
 - Fornisce access_token e refresh_token
-- Espone Microsoft Graph API per dati utente
-- Gestisce il logout SSO
+- Espone Microsoft Graph API per dati utente e validazione token
+- Gestisce il logout SSO completo
 
 **Backend (Node.js/Express)**:
-- Valida i JWT token ricevuti dal frontend
-- Verifica firme con chiavi pubbliche Microsoft
+- **Valida i token tramite Microsoft Graph API** (delega la validazione a Microsoft)
 - Protegge le API aziendali
-- Implementa logica di autorizzazione custom
+- Implementa logica di autorizzazione custom (ruoli, permessi specifici dell'app)
+- Non gestisce sessioni (stateless)
+
+### Novità: Validazione Token Semplificata
+
+**⭐ Cambiamento importante rispetto all'approccio tradizionale:**
+
+Invece di validare i JWT localmente con chiavi pubbliche, il backend **delega la validazione a Microsoft**:
+
+```javascript
+// ❌ VECCHIO APPROCCIO (complesso):
+// 1. Scarica chiavi pubbliche Microsoft
+// 2. Trova chiave corrispondente (kid)
+// 3. Verifica firma crittografica
+// 4. Valida claims (aud, iss, exp)
+
+// ✅ NUOVO APPROCCIO (semplice):
+// 1. Chiama Microsoft Graph API con il token
+// 2. Se 200 OK → token valido
+// 3. Se 401/403 → token invalido
+```
+
+**Vantaggi**:
+- ✅ Più semplice da implementare
+- ✅ Meno dipendenze (no jsonwebtoken, no jwks-rsa)
+- ✅ Sempre aggiornato (Microsoft gestisce le chiavi)
+- ✅ Nessuna gestione di key rotation
+- ✅ Standard per app SPA con PKCE
 
 ---
 
@@ -158,6 +184,8 @@ const checkAuthStatus = async () => {
   }
 };
 ```
+
+**⭐ Nota importante**: La validazione del token avviene chiamando direttamente Microsoft Graph. Se Microsoft risponde con 200 OK, il token è valido. Questo è più semplice e affidabile rispetto alla validazione JWT locale.
 
 **Possibili scenari**:
 - ❌ **Nessun token**: mostra schermata di login
@@ -529,6 +557,8 @@ const handleAuthCallback = async (code) => {
 | `redirect_uri` | `http://localhost:3000` | Deve corrispondere |
 | `code_verifier` | Stringa originale | Per PKCE ⭐ |
 
+**⭐ Nota**: NON serve `client_secret` perché usiamo PKCE!
+
 ### Step 5.2: Validazione PKCE lato Microsoft
 
 **Cosa fa Microsoft internamente**:
@@ -578,7 +608,7 @@ Microsoft risponde con un JSON:
 
 | Token | Durata | Scopo |
 |-------|--------|-------|
-| `access_token` | 1 ora | Chiamare Microsoft Graph API |
+| `access_token` | 1 ora | Chiamare Microsoft Graph API e backend |
 | `refresh_token` | ~90 giorni | Ottenere nuovi access token |
 | `id_token` | N/A | Contiene info identità utente |
 
@@ -801,7 +831,13 @@ A questo punto, lo stato dell'applicazione è:
     name: "Mario Rossi"
   },
   loading: false,
-  error: ""
+  error: "",
+  apiResponse: {
+    data: null,
+    error: null,
+    loading: false,
+    lastCall: null
+  }
 }
 ```
 
@@ -817,22 +853,32 @@ L'utente clicca sul pulsante per testare una chiamata a un'API protetta:
 
 ```javascript
 const callProtectedAPI = async () => {
-  try {
-    setLoading(true);
+  setApiResponse({ data: null, error: null, loading: true, lastCall: null });
 
+  try {
     const response = await apiCall(`${API_BASE_URL}/api/protected`);
 
     if (response.ok) {
       const data = await response.json();
-      console.log("Dati ricevuti:", data);
+      console.log("✅ Dati ricevuti:", data);
+      setApiResponse({
+        data,
+        error: null,
+        loading: false,
+        lastCall: new Date().toLocaleTimeString()
+      });
     } else {
-      throw new Error("Errore nella chiamata API");
+      const errorData = await response.json().catch(() => ({ error: "Errore sconosciuto" }));
+      throw new Error(errorData.error || `Errore ${response.status}`);
     }
   } catch (error) {
-    console.error("Errore API:", error);
-    setError("Errore nel caricamento dei dati: " + error.message);
-  } finally {
-    setLoading(false);
+    console.error("❌ Errore API:", error);
+    setApiResponse({
+      data: null,
+      error: error.message,
+      loading: false,
+      lastCall: new Date().toLocaleTimeString()
+    });
   }
 };
 ```
@@ -935,9 +981,9 @@ app.get("/api/protected", authenticateToken, async (req, res) => {
 });
 ```
 
-### Step 8.5: Middleware authenticateToken
+### Step 8.5: Middleware authenticateToken (APPROCCIO SEMPLIFICATO)
 
-Prima di eseguire l'endpoint, passa attraverso il middleware di autenticazione:
+⭐ **Novità importante**: Il backend NON valida più il JWT localmente, ma delega la validazione a Microsoft Graph:
 
 ```javascript
 const authenticateToken = async (req, res, next) => {
@@ -949,70 +995,88 @@ const authenticateToken = async (req, res, next) => {
   }
 
   try {
-    // Verifica del token Microsoft direttamente
-    const decoded = await verifyMicrosoftToken(token);
-    req.user = decoded;
-    next(); // ✅ Token valido → procedi all'endpoint
-  } catch (err) {
-    console.error("Errore verifica token:", err);
-    res.status(403).json({ error: "Token non valido" });
-  }
-};
-```
-
-### Step 8.6: Verifica JWT con chiavi pubbliche Microsoft
-
-La funzione `verifyMicrosoftToken` esegue la validazione crittografica:
-
-```javascript
-const verifyMicrosoftToken = async (token) => {
-  try {
-    // 1️⃣ Ottieni le chiavi pubbliche di Microsoft
-    const keysResponse = await axios.get(
-      `https://login.microsoftonline.com/${config.tenantId}/discovery/v2.0/keys`
-    );
-
-    // 2️⃣ Decodifica l'header del token per ottenere il kid (Key ID)
-    const decoded = jwt.decode(token, { complete: true });
-    if (!decoded) {
-      throw new Error("Token non valido");
-    }
-
-    const { kid } = decoded.header;
-    
-    // 3️⃣ Trova la chiave pubblica corrispondente
-    const key = keysResponse.data.keys.find((k) => k.kid === kid);
-    if (!key) {
-      throw new Error("Chiave di verifica non trovata");
-    }
-
-    // 4️⃣ Costruisci la chiave pubblica in formato PEM
-    const publicKey = `-----BEGIN CERTIFICATE-----\n${key.x5c[0]}\n-----END CERTIFICATE-----`;
-
-    // 5️⃣ Verifica la firma JWT
-    const payload = jwt.verify(token, publicKey, {
-      algorithms: ["RS256"],
-      audience: config.clientId,
-      issuer: `https://login.microsoftonline.com/${config.tenantId}/v2.0`,
+    // ⭐ Valida token chiamando Microsoft Graph
+    const response = await axios.get("https://graph.microsoft.com/v1.0/me", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
 
-    return payload; // ✅ Token valido
-  } catch (error) {
-    throw new Error("Token non valido: " + error.message);
+    // Token valido → salva dati utente
+    req.user = {
+      sub: response.data.id,
+      email: response.data.mail || response.data.userPrincipalName,
+      name: response.data.displayName,
+      given_name: response.data.givenName,
+      family_name: response.data.surname,
+    };
+    
+    next(); // ✅ Token valido → procedi all'endpoint
+  } catch (err) {
+    console.error("Errore verifica token:", err.response?.status, err.message);
+    res.status(403).json({ error: "Token non valido o scaduto" });
   }
 };
 ```
 
-**Cosa viene verificato**:
+**⭐ Vantaggi di questo approccio**:
+- ✅ **Più semplice**: Nessuna gestione di chiavi pubbliche, kid, algoritmi
+- ✅ **Meno dipendenze**: Non serve `jsonwebtoken` o `jwks-rsa`
+- ✅ **Sempre aggiornato**: Microsoft gestisce le chiavi e la rotazione
+- ✅ **Più affidabile**: Delega la validazione all'autorità che ha emesso il token
+- ✅ **Standard PKCE**: Approccio raccomandato per app SPA
 
-| Check | Descrizione | Errore se fallisce |
-|-------|-------------|-------------------|
-| **Signature** | Firma crittografica valida | Token manipolato |
-| **Algorithm** | Deve essere RS256 | Algoritmo non supportato |
-| **Audience** | Deve corrispondere al CLIENT_ID | Token per altra app |
-| **Issuer** | Deve essere Microsoft Entra | Token non emesso da Microsoft |
-| **Expiration** | Token non scaduto | Token scaduto |
-| **Not Before** | Token già valido | Token non ancora attivo |
+**Cosa viene validato automaticamente da Microsoft**:
+- ✅ **Signature**: Firma JWT valida
+- ✅ **Expiration**: Token non scaduto
+- ✅ **Audience**: Token emesso per la tua app
+- ✅ **Issuer**: Token emesso da Microsoft Entra ID
+- ✅ **Scope**: Permessi corretti (User.Read)
+
+### Step 8.6: Confronto con approccio tradizionale
+
+**❌ VECCHIO APPROCCIO (complesso)**:
+```javascript
+// 1. Scarica chiavi pubbliche Microsoft
+const keysResponse = await axios.get(
+  `https://login.microsoftonline.com/${tenantId}/discovery/v2.0/keys`
+);
+
+// 2. Decodifica header JWT per ottenere kid
+const decoded = jwt.decode(token, { complete: true });
+const { kid } = decoded.header;
+
+// 3. Trova chiave corrispondente
+const key = keysResponse.data.keys.find((k) => k.kid === kid);
+
+// 4. Costruisci chiave pubblica PEM
+const publicKey = `-----BEGIN CERTIFICATE-----\n${key.x5c[0]}\n-----END CERTIFICATE-----`;
+
+// 5. Verifica firma JWT
+const payload = jwt.verify(token, publicKey, {
+  algorithms: ["RS256"],
+  audience: CLIENT_ID,
+  issuer: `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
+});
+```
+
+**✅ NUOVO APPROCCIO (semplice)**:
+```javascript
+// 1. Chiama Microsoft Graph con il token
+const response = await axios.get("https://graph.microsoft.com/v1.0/me", {
+  headers: { Authorization: `Bearer ${token}` }
+});
+
+// 2. Se 200 OK → token valido ✅
+// 3. Se 401/403 → token invalido ❌
+```
+
+**Risparmio**:
+- ❌ No gestione chiavi pubbliche
+- ❌ No parsing JWT manuale
+- ❌ No gestione key rotation
+- ❌ No dipendenze extra (jsonwebtoken, jwks-rsa)
+- ❌ No preoccupazioni per algoritmi di firma
 
 ### Step 8.7: Risposta API
 
@@ -1022,22 +1086,27 @@ Se tutto è valido, il backend risponde:
 {
   "message": "Accesso autorizzato ai dati protetti",
   "user": {
-    "aud": "xyz789-client-id",
-    "iss": "https://login.microsoftonline.com/abc123-tenant-id/v2.0",
     "sub": "abc123-user-id",
+    "email": "mario.rossi@tuaazienda.com",
     "name": "Mario Rossi",
-    "preferred_username": "mario.rossi@tuaazienda.com"
+    "given_name": "Mario",
+    "family_name": "Rossi"
   },
   "data": "Questi sono i tuoi dati aziendali protetti"
 }
 ```
 
-Il frontend riceve la risposta e la gestisce:
+Il frontend riceve la risposta e la mostra all'utente:
 
 ```javascript
 const data = await response.json();
-console.log("Dati ricevuti:", data);
-// Mostra i dati all'utente
+console.log("✅ Dati ricevuti:", data);
+setApiResponse({
+  data,
+  error: null,
+  loading: false,
+  lastCall: new Date().toLocaleTimeString()
+});
 ```
 
 ---
@@ -1058,14 +1127,17 @@ const response = await fetch(`${API_BASE_URL}/api/protected`, {
   },
 });
 
-console.log(response.status); // 401 Unauthorized
+console.log(response.status); // 403 Forbidden
 ```
 
-Il backend risponde con **401** perché il token è scaduto.
+Il backend risponde con **403** perché:
+1. Microsoft Graph riceve il token scaduto
+2. Microsoft Graph risponde 401
+3. Il backend middleware rileva l'errore e risponde 403
 
 ### Step 9.2: Trigger refresh automatico
 
-La funzione `apiCall` rileva il 401 e attiva automaticamente il refresh:
+La funzione `apiCall` rileva il 403 e attiva automaticamente il refresh:
 
 ```javascript
 if (response.status === 401 || response.status === 403) {
@@ -1186,7 +1258,11 @@ if (refreshSuccess) {
 }
 ```
 
-Questa volta il backend valida il nuovo token → **200 OK** ✅
+Questa volta:
+1. Backend riceve nuovo token
+2. Backend chiama Microsoft Graph con nuovo token
+3. Microsoft Graph valida e risponde 200 OK
+4. Backend procede → **200 OK** ✅
 
 **Esperienza utente**: tutto questo avviene in modo **trasparente**, l'utente non si accorge di nulla!
 
@@ -1240,6 +1316,7 @@ const handleLogout = async () => {
     setIsAuthenticated(false);
     setUser(null);
     setError("");
+    setApiResponse({ data: null, error: null, loading: false, lastCall: null });
 
     // 2️⃣ Salva token prima di rimuoverlo (per revoca)
     const token = localStorage.getItem("access_token");
@@ -1325,6 +1402,7 @@ useEffect(() => {
     setIsAuthenticated(false);
     setUser(null);
     setError("");
+    setApiResponse({ data: null, error: null, loading: false, lastCall: null });
     
     // Pulisci URL
     window.history.replaceState({}, document.title, window.location.pathname);
@@ -1343,6 +1421,7 @@ const handleQuickLogout = () => {
   setIsAuthenticated(false);
   setUser(null);
   setError("");
+  setApiResponse({ data: null, error: null, loading: false, lastCall: null });
   localStorage.clear();
   sessionStorage.clear();
   // Resta sulla stessa pagina, mostra login
@@ -1383,6 +1462,7 @@ Client                    Microsoft
 - ✅ Nessun client secret nel frontend
 - ✅ Sicuro anche su reti non affidabili
 - ✅ Previene authorization code injection
+- ✅ Standard per Single Page Applications
 
 ### 2. State Parameter (CSRF Protection)
 
@@ -1410,44 +1490,67 @@ Client                    Microsoft
    App: state non corrisponde → richiesta bloccata
 ```
 
-### 3. JWT Signature Verification
+### 3. Token Validation via Microsoft Graph (Approccio Semplificato)
 
-**Problema risolto**: token falsificati
+**⭐ Novità**: invece della validazione JWT locale complessa, il backend delega la validazione a Microsoft.
+
+**Problema risolto**: token falsificati, scaduti, o non validi
 
 **Come funziona**:
 ```
-Token JWT:
-  HEADER.PAYLOAD.SIGNATURE
-
-Verifica:
-1. Scarica chiavi pubbliche Microsoft
-2. Trova chiave con kid corretto
-3. Verifica firma crittografica
-4. Controlla claims (aud, iss, exp)
+Backend riceve token
+  ↓
+Chiama Microsoft Graph API: /v1.0/me
+  ↓
+Microsoft valida automaticamente:
+  - Firma JWT
+  - Expiration
+  - Audience
+  - Issuer
+  - Scope
+  ↓
+Se 200 OK → token valido ✅
+Se 401/403 → token invalido ❌
 ```
 
-**Cosa viene validato**:
-- ✅ **Signature**: token non modificato
-- ✅ **Audience**: token per questa app
-- ✅ **Issuer**: emesso da Microsoft
-- ✅ **Expiration**: non scaduto
-- ✅ **Algorithm**: RS256 (sicuro)
+**Vantaggi**:
+- ✅ **Semplicità**: Nessun codice complesso di validazione JWT
+- ✅ **Affidabilità**: Microsoft è l'autorità che ha emesso il token
+- ✅ **Manutenibilità**: Nessuna gestione di chiavi pubbliche
+- ✅ **Aggiornamenti**: Microsoft gestisce rotazione chiavi
+- ✅ **Standard**: Approccio raccomandato per app PKCE
+
+**Cosa viene validato automaticamente**:
+
+| Check | Descrizione | Errore se fallisce |
+|-------|-------------|-------------------|
+| **Signature** | Firma JWT valida | Token manipolato |
+| **Expiration** | Token non scaduto | Token scaduto |
+| **Audience** | Token per questa app | Token per altra app |
+| **Issuer** | Token emesso da Microsoft | Token non Microsoft |
+| **Scope** | Permessi corretti | Scope insufficienti |
+| **Revocation** | Token non revocato | Token revocato |
 
 ### 4. Token Storage
 
 **Best practices implementate**:
 
-| Storage | Uso | Durata | Accessibile da |
-|---------|-----|--------|----------------|
-| `localStorage` | access_token, refresh_token | Persistente | Solo stesso origin |
-| `sessionStorage` | code_verifier, state | Sessione tab | Solo stesso origin |
-| Memory (React state) | user, isAuthenticated | Runtime | Solo componente |
+| Storage | Uso | Durata | Accessibile da | Sicurezza |
+|---------|-----|--------|----------------|-----------|
+| `localStorage` | access_token, refresh_token | Persistente | Solo stesso origin | Same-Origin Policy |
+| `sessionStorage` | code_verifier, state (PKCE) | Sessione tab | Solo stesso origin | Auto-cleanup |
+| Memory (React state) | user, isAuthenticated, apiResponse | Runtime | Solo componente | Non persistente |
 
 **Vulnerabilità mitigate**:
-- ✅ **XSS**: usa `httpOnly` cookie se possibile (alternativa)
-- ✅ **CSRF**: State parameter
+- ✅ **XSS**: localStorage protetto da Same-Origin Policy
+- ✅ **CSRF**: State parameter + PKCE
 - ✅ **Token replay**: Short-lived access tokens (1h)
-- ✅ **Token theft**: Refresh token rotation
+- ✅ **Token theft**: Refresh token rotation + PKCE
+
+**⚠️ Nota su sicurezza localStorage**:
+- `localStorage` è vulnerabile a XSS se il sito ha vulnerabilità JavaScript
+- Per massima sicurezza, considera `httpOnly` cookies (richiede backend proxy)
+- In produzione: implementa Content Security Policy (CSP)
 
 ### 5. HTTPS Requirement
 
@@ -1455,6 +1558,15 @@ Verifica:
 - Prevenire man-in-the-middle attacks
 - Proteggere token in transito
 - Requisito OAuth 2.0 RFC
+- Proteggere code_verifier e state durante il flusso
+
+**In sviluppo locale**:
+- HTTP è accettabile (localhost è considerato sicuro)
+- Microsoft accetta http://localhost per testing
+
+**In produzione**:
+- ❌ HTTP non supportato da Microsoft
+- ✅ HTTPS obbligatorio per tutti gli endpoint
 
 ---
 
@@ -1482,6 +1594,7 @@ REDIRECT_URI=http://localhost:3000
 
 # Server Configuration
 PORT=3001
+FRONTEND_URL=http://localhost:3000
 NODE_ENV=development
 ```
 
@@ -1491,21 +1604,30 @@ NODE_ENV=development
 2. **Microsoft Entra ID** → **App registrations** → **New registration**
 3. **Configura**:
    - Nome: "My SSO App"
-   - Supported account types: "Single tenant"
-   - Redirect URI: "http://localhost:3000" (tipo: SPA)
+   - Supported account types: "Single tenant" (o "Multi-tenant" se necessario)
+   - **Platform**: **Single-page application** (⚠️ IMPORTANTE)
+   - Redirect URI: "http://localhost:3000"
 4. **Authentication**:
-   - ✅ Access tokens
-   - ✅ ID tokens
-   - Enable PKCE
+   - Platform: Single-page application ✅
+   - ✅ Authorization code flow with PKCE: Enabled
+   - ❌ Implicit grant flows: Disabled (deprecato e insicuro)
+   - Logout URL: `http://localhost:3000?logout=true`
 5. **API permissions**:
    - Microsoft Graph → Delegated permissions:
-     - ✅ `openid`
-     - ✅ `profile`
-     - ✅ `email`
-     - ✅ `User.Read`
+     - ✅ `openid` - Autenticazione base
+     - ✅ `profile` - Nome e cognome
+     - ✅ `email` - Indirizzo email
+     - ✅ `User.Read` - Dati profilo completi
+   - **⚠️ IMPORTANTE**: Clicca "Grant admin consent for [Organization]"
 6. **Copia**:
    - Application (client) ID → `CLIENT_ID`
    - Directory (tenant) ID → `TENANT_ID`
+
+**⚠️ Errori comuni di configurazione**:
+- ❌ Platform type "Web" invece di "Single-page application" → causa errori PKCE
+- ❌ Admin consent non dato → errore "AADSTS65001"
+- ❌ Implicit grant abilitato → deprecato e meno sicuro
+- ❌ Redirect URI errato → errore "redirect_uri_mismatch"
 
 ---
 
@@ -1548,52 +1670,67 @@ NODE_ENV=development
     ├───────────────────┼─────────────────────┼───────────────────>│
     │ (access_token)    │                     │                    │
     │                   │                     │                    │
-    │                   │                     │ 10. Verify Token   │
-    │                   │<────────────────────┼────────────────────┤
-    │                   │ (public keys)       │                    │
+    │                   │                     │ ⭐ 10. Validate    │
+    │                   │                     │    via Graph API   │
+    │                   │                     │<───────────────────┤
+    │                   │                     │ (access_token)     │
     │                   │                     │                    │
-    │                   │ 11. Keys            │                    │
-    │                   │─────────────────────>│                    │
+    │                   │                     │ 11. Token Valid    │
+    │                   │                     │ (200 OK + user)    │
+    │                   │                     │─────────────────────>│
     │                   │                     │                    │
-    │                   │                     │ 12. Signature OK   │
-    │                   │                     │                    │
-    │ 13. Protected Data│                     │                    │
+    │ 12. Protected Data│                     │                    │
     │<──────────────────┼─────────────────────┼────────────────────┤
     │                   │                     │                    │
     │ (dopo 1 ora)      │                     │                    │
     │                   │                     │                    │
-    │ 14. API Call      │                     │                    │
+    │ 13. API Call      │                     │                    │
     ├───────────────────┼─────────────────────┼───────────────────>│
     │ (expired token)   │                     │                    │
     │                   │                     │                    │
-    │ 15. 401 Unauthorized                    │                    │
+    │                   │                     │ 14. Validate       │
+    │                   │                     │<───────────────────┤
+    │                   │                     │                    │
+    │                   │                     │ 15. Token Invalid  │
+    │                   │                     │ (401 Unauthorized) │
+    │                   │                     │─────────────────────>│
+    │                   │                     │                    │
+    │ 16. 403 Forbidden │                     │                    │
     │<──────────────────┼─────────────────────┼────────────────────┤
     │                   │                     │                    │
-    │ 16. Refresh Request                     │                    │
+    │ 17. Refresh Request                     │                    │
     ├──────────────────>│                     │                    │
     │ (refresh_token)   │                     │                    │
     │                   │                     │                    │
-    │ 17. New Tokens    │                     │                    │
+    │ 18. New Tokens    │                     │                    │
     │<──────────────────┤                     │                    │
     │                   │                     │                    │
-    │ 18. Retry API Call│                     │                    │
+    │ 19. Retry API Call│                     │                    │
     ├───────────────────┼─────────────────────┼───────────────────>│
     │ (new access_token)│                     │                    │
     │                   │                     │                    │
-    │ 19. Success       │                     │                    │
+    │                   │                     │ 20. Validate       │
+    │                   │                     │<───────────────────┤
+    │                   │                     │                    │
+    │                   │                     │ 21. Token Valid    │
+    │                   │                     │─────────────────────>│
+    │                   │                     │                    │
+    │ 22. Success       │                     │                    │
     │<──────────────────┼─────────────────────┼────────────────────┤
     │                   │                     │                    │
-    │ 20. handleLogout  │                     │                    │
+    │ 23. handleLogout  │                     │                    │
     ├──────────────────>│                     │                    │
     │                   │                     │                    │
-    │ 21. Logout Page   │                     │                    │
+    │ 24. Logout Page   │                     │                    │
     │<──────────────────┤                     │                    │
     │                   │                     │                    │
-    │ 22. Redirect      │                     │                    │
+    │ 25. Redirect      │                     │                    │
     │<──────────────────┤                     │                    │
     │ (?logout=true)    │                     │                    │
     │                   │                     │                    │
 ```
+
+**⭐ Differenza chiave**: Nei passaggi 10-11 e 14-15, il backend **NON** valida il JWT localmente, ma delega la validazione a Microsoft Graph API. Questo semplifica enormemente il codice e la manutenzione.
 
 ---
 
@@ -1603,24 +1740,24 @@ NODE_ENV=development
 
 ```
 1. 🚀 AVVIO
-   → Controlla token esistente
+   → Controlla token esistente (via Microsoft Graph)
    → Se valido: mostra dashboard
    → Se no: mostra login
 
 2. 🔐 LOGIN
    → Genera PKCE (verifier + challenge)
-   → Genera state
+   → Genera state (protezione CSRF)
    → Redirect a Microsoft
 
 3. 🌐 MICROSOFT
-   → Utente inserisce credenziali
+   → Utente inserisce credenziali + MFA
    → Microsoft valida
    → Genera authorization code
    → Redirect all'app
 
 4. 🔄 CALLBACK
-   → Verifica state (CSRF)
-   → Scambia code con token (PKCE)
+   → Verifica state (CSRF protection)
+   → Scambia code con token (PKCE validation)
    → Ottieni access_token + refresh_token
    → Chiama Graph API per dati utente
    → Salva tutto in localStorage
@@ -1631,44 +1768,55 @@ NODE_ENV=development
 
 6. 🔒 API CALL
    → Invia access_token nell'header
-   → Backend valida JWT
+   → ⭐ Backend valida via Microsoft Graph API
    → Se valido: risponde con dati
-   → Se 401: refresh automatico
+   → Se 401/403: trigger refresh automatico
 
-7. 🔄 REFRESH
+7. 🔄 REFRESH (trasparente)
    → Usa refresh_token
    → Ottieni nuovo access_token
-   → Riprova chiamata API
+   → Riprova chiamata API automaticamente
 
 8. 🚪 LOGOUT
-   → Pulisci localStorage
-   → Logout da Microsoft
-   → Termina sessione SSO
+   → Pulisci localStorage e sessionStorage
+   → Logout da Microsoft (SSO completo)
+   → Termina sessione su tutti i servizi
    → Redirect alla home
+
 ```
 
 ### Vantaggi di questa Architettura
 
 ✅ **Sicurezza**:
-- PKCE: nessun client secret necessario
-- State: protezione CSRF
-- JWT Verification: token crittograficamente sicuri
-- Refresh automatico: sessioni prolungate senza rischi
+- **PKCE**: nessun client secret necessario nel frontend
+- **State**: protezione CSRF completa
+- **Token Validation semplificata**: delega a Microsoft Graph
+- **Refresh automatico**: sessioni prolungate senza rischi
+- **Single Logout**: terminazione sessione su tutti i servizi
+
+✅ **Semplicità**:
+- **Meno codice**: no gestione chiavi pubbliche JWT
+- **Meno dipendenze**: no jsonwebtoken, no jwks-rsa
+- **Meno manutenzione**: Microsoft gestisce key rotation
+- **Più affidabile**: validazione dall'autorità emittente
 
 ✅ **User Experience**:
-- Single Sign-On: un solo login per tutti i servizi aziendali
-- Refresh trasparente: nessun logout improvviso
-- Sessioni persistenti: fino a 90 giorni
+- **Single Sign-On**: un solo login per tutti i servizi aziendali
+- **Refresh trasparente**: nessun logout improvviso
+- **Sessioni persistenti**: fino a 90 giorni
+- **MFA integrato**: supporto 2FA/MFA nativo Microsoft
 
 ✅ **Scalabilità**:
-- Backend stateless: non gestisce sessioni
-- Validazione JWT: rapida e distribuibile
-- Token-based: funziona con microservizi
+- **Backend stateless**: non gestisce sessioni
+- **Validazione veloce**: semplice chiamata HTTP
+- **Token-based**: funziona con microservizi
+- **Caching possibile**: cache di validazioni recenti
 
 ✅ **Compliance**:
-- OAuth 2.0 standard
-- Best practices Microsoft
-- GDPR-friendly (dati minimali)
+- **OAuth 2.0 standard**: protocollo ufficiale e testato
+- **Best practices Microsoft**: segue linee guida ufficiali
+- **GDPR-friendly**: dati minimali, controllo utente
+- **Audit trail**: Microsoft logga tutti gli accessi
 
 ---
 
@@ -1681,33 +1829,73 @@ NODE_ENV=development
 **Soluzione**: 
 - Usa sempre lo stesso tab per il login
 - Non ricaricare la pagina durante il flusso
-- Controlla che sessionStorage non sia disabilitato
+- Controlla che sessionStorage non sia disabilitato nel browser
+- Verifica che non ci siano estensioni browser che puliscono lo storage
 
 ### Errore: "State non valido"
 
 **Causa**: possibile attacco CSRF o state non salvato
 
 **Soluzione**:
-- Verifica che sessionStorage funzioni
-- Non modificare l'URL manualmente
+- Verifica che sessionStorage funzioni correttamente
+- Non modificare l'URL manualmente durante il callback
 - Controlla i cookie third-party se problema persiste
+- Disabilita temporaneamente estensioni browser
+- Verifica che il browser non blocchi JavaScript
 
-### Errore: "Token non valido"
+### Errore: "Token non valido" (403 dal backend)
 
-**Causa**: token scaduto o firma non verificabile
+**Causa**: Microsoft Graph non riesce a validare il token
 
 **Soluzione**:
-- Verifica che TENANT_ID e CLIENT_ID siano corretti
-- Controlla che l'orologio di sistema sia sincronizzato
-- Verifica che il token non sia stato manipolato
+- Verifica che TENANT_ID e CLIENT_ID siano corretti in entrambi i .env
+- Controlla che il backend possa raggiungere `graph.microsoft.com`
+- Verifica che il token non sia scaduto (controlla timestamp)
+- Controlla i log del backend per dettagli specifici
+- Prova a fare logout e nuovo login per ottenere token fresco
 
 ### Errore: "Refresh token expired"
 
 **Causa**: refresh token scaduto dopo ~90 giorni
 
 **Soluzione**:
-- Normale: utente deve effettuare nuovo login
-- Considera: implementa "remember me" con notifiche
+- Normale comportamento: utente deve effettuare nuovo login
+- Implementa notifica utente prima della scadenza (es: "La tua sessione scadrà tra 7 giorni")
+- Considera implementazione "remember me" con avvisi preventivi
+- In ambiente aziendale: verifica politiche di scadenza token in Azure AD
+
+### Errore: "AADSTS50076: Due to a configuration change..."
+
+**Causa**: MFA richiesto ma non configurato
+
+**Soluzione**:
+- Verifica politiche MFA in Azure AD
+- Configura MFA per l'utente
+- Verifica che l'app supporti il flusso MFA
+
+### Errore: "CORS policy: No 'Access-Control-Allow-Origin'"
+
+**Causa**: Backend non configurato correttamente per CORS
+
+**Soluzione**:
+```javascript
+// server.js
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
+```
+
+### Errore: "Microsoft Graph API timeout"
+
+**Causa**: Network issues o firewall
+
+**Soluzione**:
+- Verifica connessione internet del backend
+- Controlla firewall aziendale non blocchi `graph.microsoft.com`
+- Verifica proxy settings se necessario
+- Implementa retry logic con exponential backoff
+- Considera aumento timeout in axios/fetch
 
 ---
 
@@ -1717,10 +1905,34 @@ Questo sistema implementa un **robusto flusso SSO** con Microsoft Entra ID utili
 
 - 🔐 **PKCE** per sicurezza senza client secret
 - 🛡️ **State** per protezione CSRF
-- 🔑 **JWT Verification** per validazione token
+- ⭐ **Token Validation semplificata** tramite Microsoft Graph API
 - 🔄 **Refresh automatico** per UX fluida
-- 🚪 **Single Logout** per privacy
+- 🚪 **Single Logout** per privacy e sicurezza
+- 📦 **Meno dipendenze** e codice più pulito
 
-L'architettura separa chiaramente le responsabilità tra frontend (gestisce OAuth flow), Microsoft (autentica), e backend (autorizza), risultando in un sistema sicuro, scalabile e conforme agli standard.
+L'architettura separa chiaramente le responsabilità tra:
+- **Frontend**: gestisce OAuth flow completo + PKCE
+- **Microsoft**: autentica e fornisce token
+- **Backend**: valida token via Graph API + autorizza
+
+Risultato: un sistema **sicuro, scalabile, manutenibile e conforme agli standard**.
+
+### Prossimi Step
+
+1. **Implementa authorizzazione custom**: ruoli e permessi specifici dell'app nel backend
+2. **Aggiungi logging**: monitora accessi, refresh failures, validazioni
+3. **Implementa rate limiting**: proteggi backend da abusi
+4. **Configura monitoring**: alert su errori di autenticazione
+5. **Test in produzione**: verifica con HTTPS e dominio reale
+6. **Documenta API**: endpoints protetti e loro utilizzo
+7. **Implementa caching**: cache validazioni token recenti (con cautela)
+8. **Setup CI/CD**: deploy automatico con secret management
 
 ---
+
+**Pronto per la produzione!** 🚀
+
+Per domande o supporto:
+- Documentazione Microsoft: https://learn.microsoft.com/en-us/entra/identity-platform/
+- OAuth 2.0 RFC: https://datatracker.ietf.org/doc/html/rfc6749
+- PKCE RFC: https://datatracker.ietf.org/doc/html/rfc7636

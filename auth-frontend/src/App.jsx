@@ -1,11 +1,24 @@
 import { useState, useEffect } from "react";
-import { User, Shield, LogOut, Loader2 } from "lucide-react";
+import {
+  User,
+  Shield,
+  LogOut,
+  Loader2,
+  CheckCircle,
+  XCircle,
+} from "lucide-react";
 
 const App = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [apiResponse, setApiResponse] = useState({
+    data: null,
+    error: null,
+    loading: false,
+    lastCall: null,
+  });
 
   // Configurazione Microsoft Entra ID
   const CLIENT_ID = import.meta.env.VITE_CLIENT_ID || "your-client-id";
@@ -202,25 +215,36 @@ const App = () => {
     return response;
   };
 
-  // Esempio di utilizzo delle API protette
+  // Chiamata API protetta
   const callProtectedAPI = async () => {
-    try {
-      setLoading(true);
+    setApiResponse({ data: null, error: null, loading: true, lastCall: null });
 
+    try {
       const response = await apiCall(`${API_BASE_URL}/api/protected`);
 
       if (response.ok) {
         const data = await response.json();
-        console.log("Dati ricevuti:", data);
-        // Gestisci i dati ricevuti
+        console.log("✅ Dati ricevuti:", data);
+        setApiResponse({
+          data,
+          error: null,
+          loading: false,
+          lastCall: new Date().toLocaleTimeString(),
+        });
       } else {
-        throw new Error("Errore nella chiamata API");
+        const errorData = await response
+          .json()
+          .catch(() => ({ error: "Errore sconosciuto" }));
+        throw new Error(errorData.error || `Errore ${response.status}`);
       }
     } catch (error) {
-      console.error("Errore API:", error);
-      setError("Errore nel caricamento dei dati: " + error.message);
-    } finally {
-      setLoading(false);
+      console.error("❌ Errore API:", error);
+      setApiResponse({
+        data: null,
+        error: error.message,
+        loading: false,
+        lastCall: new Date().toLocaleTimeString(),
+      });
     }
   };
 
@@ -259,9 +283,9 @@ const App = () => {
     setIsAuthenticated(false);
     setUser(null);
     setError("");
+    setApiResponse({ data: null, error: null, loading: false, lastCall: null });
     localStorage.clear();
     sessionStorage.clear();
-    // Resta sulla stessa pagina, mostra login
   };
 
   const handleLogout = async () => {
@@ -270,6 +294,12 @@ const App = () => {
       setIsAuthenticated(false);
       setUser(null);
       setError("");
+      setApiResponse({
+        data: null,
+        error: null,
+        loading: false,
+        lastCall: null,
+      });
 
       // 2. Rimuovi token dal localStorage
       const token = localStorage.getItem("access_token");
@@ -298,7 +328,6 @@ const App = () => {
           );
         } catch (revokeError) {
           console.warn("Errore revoca token:", revokeError);
-          // Non bloccare il logout se la revoca fallisce
         }
       }
 
@@ -309,14 +338,11 @@ const App = () => {
           REDIRECT_URI + "?logout=true"
         )}`;
 
-      // Piccolo delay per permettere al cleanup di completarsi
       setTimeout(() => {
         window.location.href = logoutUrl;
       }, 100);
     } catch (error) {
       console.error("Errore durante logout:", error);
-
-      // Anche se c'è un errore, forza il logout locale
       handleQuickLogout();
     }
   };
@@ -476,7 +502,8 @@ const App = () => {
                     <span className="font-medium">Email:</span> {user.email}
                   </div>
                   <div>
-                    <span className="font-medium">ID Utente:</span> {user.sub}
+                    <span className="font-medium">ID Utente:</span>{" "}
+                    <span className="text-xs">{user.sub}</span>
                   </div>
                 </div>
               </div>
@@ -485,12 +512,13 @@ const App = () => {
                 <h3 className="font-semibold text-gray-800 mb-3">
                   Test API Protette
                 </h3>
+
                 <button
                   onClick={callProtectedAPI}
-                  disabled={loading}
+                  disabled={apiResponse.loading}
                   className="w-full bg-blue-600 text-white py-2 px-4 rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                 >
-                  {loading ? (
+                  {apiResponse.loading ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
                       Caricamento...
@@ -499,8 +527,55 @@ const App = () => {
                     "Testa API Protetta"
                   )}
                 </button>
-                <p className="text-xs text-gray-600 mt-2">
-                  Questo pulsante testa il refresh automatico dei token
+
+                {/* Mostra risultati di successo */}
+                {apiResponse.data && (
+                  <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-lg">
+                    <div className="flex items-start gap-2">
+                      <div className="flex-shrink-0">
+                        <CheckCircle className="w-5 h-5 text-green-600 mt-0.5" />
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-sm font-semibold text-green-800 mb-1">
+                          {apiResponse.data.message}
+                        </p>
+                        <p className="text-xs text-green-700 mb-2">
+                          {apiResponse.data.data}
+                        </p>
+                        <div className="text-xs text-green-600 space-y-1">
+                          <p>Utente: {apiResponse.data.user.name}</p>
+                          <p>Chiamata effettuata: {apiResponse.lastCall}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Mostra errori */}
+                {apiResponse.error && (
+                  <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+                    <div className="flex items-start gap-2">
+                      <div className="flex-shrink-0">
+                        <XCircle className="w-5 h-5 text-red-600 mt-0.5" />
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-sm font-semibold text-red-800 mb-1">
+                          Errore nella chiamata API
+                        </p>
+                        <p className="text-xs text-red-700 mb-2">
+                          {apiResponse.error}
+                        </p>
+                        <p className="text-xs text-red-600">
+                          Tentativo: {apiResponse.lastCall}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <p className="text-xs text-gray-600 mt-3">
+                  Questo pulsante testa il refresh automatico dei token e la
+                  chiamata alle API protette del backend
                 </p>
               </div>
 
